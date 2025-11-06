@@ -1,0 +1,446 @@
+/*
+  AquaSpec ESP32 + SPI OLED + Supabase (no BLE) — OTHER-DEVICE CALIBRATION
+  - SPI OLED: MOSI=23, CLK=18, DC=21, CS=19, RESET=22  (SSD1306 128x64)
+  - Buttons: UP=25, DOWN=26, SELECT=27
+  - Sensors: DS18B20 on GPIO4, TDS on 33, pH on 32
+  - Wi-Fi -> fetch tanks -> OLED list -> measure (calibrated) -> POST sensor_readings
+
+  Serial: 115200
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// ====== EDIT THESE TWO ONLY ======
+const char* WIFI_SSID = "SpectrumSetup-85BC";
+const char* WIFI_PASS = "completedelivery235";
+// =================================
+
+// Supabase
+const char* SUPABASE_HOST = "dbfglovgjuzqiejekflg.supabase.co";
+const char* SUPABASE_ANON =
+"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRiZmds"
+"b3ZnanV6cWllamVrZmxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM4ODI2NzQsImV4cCI6MjA1"
+"OTQ1ODY3NH0.mzRht4dDiCC9GQlX_5c1K_UJKWXvKeAHPBHqBVNsHvU";
+
+// ---------- Buttons ----------
+#define UP_BUTTON     25
+#define DOWN_BUTTON   26
+#define SELECT_BUTTON 27
+
+// ---------- Sensors ----------
+#define ONE_WIRE_BUS 4    // DS18B20
+#define TDS_PIN      33
+#define PH_PIN       32
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// ---------- Timings ----------
+const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+const uint32_t TLS_TIMEOUT_MS          = 15000;
+const uint32_t LIST_REFRESH_MS         = 30000;
+
+// ---------- Data types ----------
+struct Tank { String id; String name; };
+struct Reading { float tempC; float tempF; float ph; int tds; };
+
+// ---------- Globals ----------
+Tank tanks[20];
+int  tankCount = 0;
+int  selectedTank = 0;
+
+// ---------- SPI OLED (your wiring) ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_RESET  22
+#define OLED_DC     21
+#define OLED_CS     19
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+
+// ---------- Prototypes ----------
+bool connectWifi();
+bool fetchTanks();
+bool insertReading(const String& tankId, const Reading& r);
+Reading takeReading();               // uses your OTHER-device calibration flow
+float measurePH();                   // calibrated (other device)
+int   measureTDS(float TEMP);        // calibrated + temp compensation (other device)
+float measureTemp();                 // DS18B20
+void  setupButtons();
+void  drawSplash();
+void  drawWifiStatus(const char* line1, const char* line2, int spinner = -1);
+void  drawWifiStatus(const char* line1, const String& line2, int spinner = -1); // overload
+void  drawTanksMenu();
+void  drawMeasuring(const char* tankName, int dots);
+void  drawMeasureResult(const Reading& r);
+void  drawUploadBadge(bool ok);
+
+// ---------- Utils ----------
+template<typename T>
+T medianOf(T* arr, int n){
+  for(int i=1;i<n;i++){ T key=arr[i]; int j=i-1; while(j>=0 && arr[j]>key){arr[j+1]=arr[j]; j--;} arr[j+1]=key; }
+  if(n%2) return arr[n/2];
+  return (arr[n/2 - 1] + arr[n/2]) / 2.0;
+}
+
+// ================= SENSOR MEASUREMENT (OTHER DEVICE CALIBRATION) =================
+
+// pH: -0.0062 * ADC + 18.2618
+float measurePH() {
+  int sensorValue = analogRead(PH_PIN);          // 0..4095
+  float phValue = -0.0062f * sensorValue + 18.2618f;
+  return phValue;
+}
+
+// TDS: temp compensation + cubic -> ppm, then scale by 0.544
+int measureTDS(float TEMP) {
+  int sensorValue = analogRead(TDS_PIN);         // 0..4095
+  float voltage = sensorValue * (3.3f / 4095.0f);
+  float compensationCoefficient = 1.0f + 0.02f * (TEMP - 25.0f);
+  float compensatedVoltage = voltage / compensationCoefficient;
+  float tdsValue = (133.42f * pow(compensatedVoltage, 3)
+                 - 255.86f * pow(compensatedVoltage, 2)
+                 + 857.39f * compensatedVoltage) * 0.5f;
+  tdsValue = tdsValue * 0.544f;                  // calibration scale
+  return (int)tdsValue;
+}
+
+// DS18B20 temperature (Celsius)
+float measureTemp() {
+  sensors.requestTemperatures();
+  float temp = sensors.getTempCByIndex(0);
+  if (temp < -100.0f || temp > 85.0f) temp = 25.0f; // guard
+  return temp;
+}
+
+// Take samples (temp first), then pH + TDS, return medians
+Reading takeReading(){
+  const int NUM_SAMPLES = 10;
+  float phSamples[NUM_SAMPLES];
+  int   tdsSamples[NUM_SAMPLES];
+  float tempSamples[NUM_SAMPLES];
+
+  unsigned long interval = 1000 / NUM_SAMPLES;
+
+  // 1) Temperature first
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    tempSamples[i] = measureTemp();
+    drawMeasuring(tankCount ? tanks[selectedTank].name.c_str() : "Tank", i % 4);
+    if (i < NUM_SAMPLES - 1) delay(interval);
+  }
+  float tempC_med = medianOf(tempSamples, NUM_SAMPLES);
+
+  // 2) pH + TDS
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    phSamples[i]  = measurePH();
+    tdsSamples[i] = measureTDS(tempC_med);
+    drawMeasuring(tankCount ? tanks[selectedTank].name.c_str() : "Tank", i % 4);
+    if (i < NUM_SAMPLES - 1) delay(interval);
+  }
+
+  Reading r;
+  r.tempC = tempC_med;
+  r.tempF = r.tempC * 9.0f/5.0f + 32.0f;
+  r.ph    = medianOf(phSamples, NUM_SAMPLES);
+  r.tds   = medianOf(tdsSamples, NUM_SAMPLES);
+  return r;
+}
+
+// ================== Wi-Fi ==================
+bool connectWifi() {
+  Serial.printf("Connecting to Wi-Fi [%s]\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  int spin = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+    drawWifiStatus("Connecting Wi-Fi", WIFI_SSID, spin++ % 4);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Wi-Fi OK  IP: %s  RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    drawWifiStatus("Wi-Fi Connected", WiFi.localIP().toString(), -1);
+    return true;
+  } else {
+    Serial.printf("Wi-Fi FAILED (status=%d)\n", WiFi.status());
+    drawWifiStatus("Wi-Fi FAILED", "Check SSID/2.4GHz", -1);
+    return false;
+  }
+}
+
+// ================== HTTPS helpers ==================
+bool httpBegin(HTTPClient& http, WiFiClientSecure& client, const String& url){
+  client.setInsecure(); // testing only
+  client.setHandshakeTimeout(TLS_TIMEOUT_MS);
+  client.setTimeout(TLS_TIMEOUT_MS);
+  if (!http.begin(client, url)) return false;
+  http.setConnectTimeout(TLS_TIMEOUT_MS);
+  http.setTimeout(TLS_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_ANON);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON);
+  return true;
+}
+
+// ================== Fetch tanks ==================
+bool fetchTanks(){
+  tankCount = 0;
+  drawWifiStatus("Fetching tanks...", "", -1);
+
+  IPAddress ip;
+  if (!WiFi.hostByName(SUPABASE_HOST, ip)) {
+    Serial.println("DNS FAILED");
+    drawWifiStatus("DNS FAILED", "", -1);
+    return false;
+  }
+
+  String url = "https://" + String(SUPABASE_HOST) + "/rest/v1/tanks?select=id,name&order=name.asc";
+  WiFiClientSecure client;
+  HTTPClient http;
+  if(!httpBegin(http, client, url)){ Serial.println("http.begin failed"); drawWifiStatus("HTTP begin failed", "", -1); return false; }
+
+  int code = http.GET();
+  String body = http.getString();
+  http.end();
+  Serial.printf("GET /tanks -> %d\n", code);
+
+  if (code != HTTP_CODE_OK) {
+    Serial.println(body);
+    drawWifiStatus("Fetch tanks failed", String("HTTP ") + code, -1);
+    return false;
+  }
+
+  // Parse: [{"id":"...","name":"..."},...]
+  int pos = 0;
+  while (tankCount < 20) {
+    int idK = body.indexOf("\"id\":\"", pos);    if (idK < 0) break;
+    int idQ = body.indexOf("\"", idK + 6);       if (idQ < 0) break;
+    int nmK = body.indexOf("\"name\":\"", idQ);  if (nmK < 0) break;
+    int nmQ = body.indexOf("\"", nmK + 8);       if (nmQ < 0) break;
+    tanks[tankCount].id   = body.substring(idK + 6, idQ);
+    tanks[tankCount].name = body.substring(nmK + 8, nmQ);
+    tankCount++;
+    pos = nmQ + 1;
+  }
+
+  Serial.printf("Fetched %d tank(s):\n", tankCount);
+  for (int i=0;i<tankCount;i++){
+    Serial.printf("  [%d] %s  (id=%s)\n", i, tanks[i].name.c_str(), tanks[i].id.c_str());
+  }
+  if (tankCount == 0) drawWifiStatus("No tanks found", "", -1);
+  if (selectedTank >= tankCount) selectedTank = 0;
+
+  drawTanksMenu();
+  return tankCount > 0;
+}
+
+// ================== Insert reading ==================
+bool insertReading(const String& tankId, const Reading& r){
+  String url = "https://" + String(SUPABASE_HOST) + "/rest/v1/sensor_readings";
+  WiFiClientSecure client; HTTPClient http;
+  if(!httpBegin(http, client, url)){ Serial.println("http.begin failed"); return false; }
+
+  // Adjust if your column names differ:
+  String json = String("{")
+    + "\"tank_id\":\"" + tankId + "\","
+    + "\"temperature\":" + String(r.tempF,1) + ","  // Fahrenheit
+    + "\"ph\":" + String(r.ph,2) + ","
+    + "\"tds\":" + String(r.tds)
+    + "}";
+
+  http.addHeader("Prefer", "return=representation");
+  int code = http.POST(json);
+  String body = http.getString();
+  http.end();
+
+  Serial.printf("POST /sensor_readings -> %d\n", code);
+  if (body.length()) Serial.println(body);
+
+  return code >= 200 && code < 300;
+}
+
+// ================== OLED drawing ==================
+void drawSplash(){
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(8, 8);  display.print("AquaSpec");
+  display.setTextSize(1);
+  display.setCursor(8, 36); display.print("Starting...");
+  display.display();
+}
+
+void drawWifiStatus(const char* line1, const char* line2, int spinner){
+  static const char* sp[4] = {"-", "\\", "|", "/"};
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 10);  display.print(line1);
+  display.setCursor(2, 24);  display.print(line2);
+  if (spinner >= 0) {
+    display.setCursor(112, 10); display.print(sp[spinner%4]);
+  }
+  display.display();
+}
+void drawWifiStatus(const char* line1, const String& line2, int spinner){
+  drawWifiStatus(line1, line2.c_str(), spinner);
+}
+
+void drawTanksMenu(){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (tankCount == 0) {
+    display.setCursor(2, 10); display.print("No tanks found");
+    display.setCursor(2, 24); display.print("Add tanks in app");
+    display.display();
+    return;
+  }
+
+  // Header
+  display.setCursor(2, 0);
+  display.print("Select Tank ");
+  display.print(selectedTank+1); display.print("/"); display.print(tankCount);
+
+  // Show up to 4 entries
+  int start = selectedTank - 1;
+  if (start < 0) start = 0;
+  if (start > max(0, tankCount-4)) start = max(0, tankCount-4);
+
+  for (int i=0; i<4 && (start+i) < tankCount; i++){
+    int idx = start + i;
+    int y = 14 + i*13;
+    if (idx == selectedTank) {
+      display.setCursor(0, y); display.print(">");
+      display.fillRect(8, y-1, 120, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(10, y); display.print(tanks[idx].name);
+      display.setTextColor(SSD1306_WHITE);
+    } else {
+      display.setCursor(10, y); display.print(tanks[idx].name);
+    }
+  }
+
+  display.setCursor(2, 58);
+  display.print("UP/DOWN  SELECT=Measure");
+  display.display();
+}
+
+void drawMeasuring(const char* tankName, int dots){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0);  display.print("Measuring");
+  display.setCursor(2, 12); display.print(tankName);
+  display.setCursor(2, 32); display.print("Please wait");
+  display.setCursor(90, 32);
+  for (int i=0;i<(dots%4);i++) display.print(".");
+  display.display();
+}
+
+void drawMeasureResult(const Reading& r){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0);  display.print("Result");
+  display.setCursor(2, 16); display.print("pH: ");   display.print(r.ph, 2);
+  display.setCursor(2, 28); display.print("TDS: ");  display.print(r.tds); display.print(" ppm");
+  display.setCursor(2, 40); display.print("Temp: "); display.print(r.tempC,1); display.print((char)247); display.print("C");
+  display.setCursor(2, 52); display.print("("); display.print(r.tempF,1); display.print((char)247); display.print("F)");
+  display.display();
+}
+
+void drawUploadBadge(bool ok){
+  display.fillRect(88, 0, 40, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(92, 2); display.print(ok ? "Sent" : "Fail");
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+}
+
+// ================== Buttons ==================
+void setupButtons(){
+  pinMode(UP_BUTTON,     INPUT_PULLUP);
+  pinMode(DOWN_BUTTON,   INPUT_PULLUP);
+  pinMode(SELECT_BUTTON, INPUT_PULLUP);
+}
+
+// ================== Arduino entry ==================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("=== AquaSpec (SPI OLED + Supabase, OTHER calibration) ===");
+
+  // SPI OLED init
+  SPI.begin(OLED_CLK, -1, OLED_MOSI, OLED_CS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    // continue headless
+  } else {
+    display.setRotation(3);
+    drawSplash();
+  }
+
+  sensors.begin();
+  setupButtons();
+
+  if (!connectWifi()) return;
+  fetchTanks(); // draws the menu
+}
+
+void loop() {
+  static uint32_t lastFetch = 0;
+  static uint32_t lastDebounce = 0;
+  const uint32_t debounceMs = 180;
+
+  // periodic refresh of tank list
+  if (millis() - lastFetch > LIST_REFRESH_MS) {
+    lastFetch = millis();
+    fetchTanks();
+  }
+
+  if (millis() - lastDebounce > debounceMs) {
+    if (digitalRead(UP_BUTTON) == LOW && tankCount > 0) {
+      selectedTank = (selectedTank - 1 + tankCount) % tankCount;
+      drawTanksMenu();
+      lastDebounce = millis();
+    } else if (digitalRead(DOWN_BUTTON) == LOW && tankCount > 0) {
+      selectedTank = (selectedTank + 1) % tankCount;
+      drawTanksMenu();
+      lastDebounce = millis();
+    } else if (digitalRead(SELECT_BUTTON) == LOW && tankCount > 0) {
+      lastDebounce = millis();
+      // Measure (OTHER device calibration)
+      drawMeasuring(tanks[selectedTank].name.c_str(), 0);
+      Reading r = takeReading();
+      Serial.printf("Measured %s: pH=%.2f TDS=%d Temp=%.1fC(%.1fF)\n",
+        tanks[selectedTank].name.c_str(), r.ph, r.tds, r.tempC, r.tempF);
+
+      // Show result, then upload status
+      drawMeasureResult(r);
+      bool ok = insertReading(tanks[selectedTank].id, r);
+      Serial.println(ok ? "Upload OK" : "Upload FAILED");
+      drawUploadBadge(ok);
+
+      delay(1200);
+      drawTanksMenu();
+    }
+  }
+}
