@@ -1,0 +1,698 @@
+/*
+  AquaSpec ESP32 + SPI OLED + BLE Provisioning + Supabase CRUD (Calibrated)
+  - BLE Provisioning (Nordic UART):
+      PROVISION:SSID|PASS|DEVICE_UID|SUPABASE_URL|SUPABASE_KEY\n
+      SET_TANKS:name1|name2|... (max 10)
+      SET_TANK_IDS:id1|id2|...
+      SET_NAME:My Device
+      SELECT_TANK:index
+      NEXT_TANK / PREV_TANK / MEASURE
+  - OLED menu (list tanks) -> select -> measure (calibrated) -> POST to Supabase
+  - Buttons: UP=25, DOWN=26, SELECT=27
+  - SPI OLED: MOSI=23, CLK=18, DC=21, CS=19, RESET=22
+  - Sensors: DS18B20 on 4, TDS on 33, pH on 32
+
+  Serial: 115200
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// ----------- Buttons -----------
+#define UP_BUTTON     25
+#define DOWN_BUTTON   26
+#define SELECT_BUTTON 27
+
+// ----------- Sensors -----------
+#define ONE_WIRE_BUS 4
+#define TDS_PIN      33
+#define PH_PIN       32
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// ----------- OLED (SPI) -----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_RESET  22
+#define OLED_DC     21
+#define OLED_CS     19
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+
+// ----------- BLE (Nordic UART) -----------
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+#define DEV_NAME "AquaSpec-Device"
+static BLEUUID SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID RX_UUID     ("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // write
+static BLEUUID TX_UUID     ("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify
+
+BLEServer*         pServer = nullptr;
+BLECharacteristic* pTxChar = nullptr;
+bool deviceConnected = false;
+static std::string g_rxBuf;
+
+// ----------- Timings -----------
+const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+const uint32_t TLS_TIMEOUT_MS          = 15000;
+const uint32_t LIST_REFRESH_MS         = 30000;
+
+// ----------- Data types -----------
+struct Tank { String id; String name; };
+struct Reading { float tempC; float tempF; float ph; int tds; };
+
+// ----------- State / Globals -----------
+Preferences prefs;
+
+String WIFI_SSID = "";
+String WIFI_PASS = "";
+String SUPABASE_URL = "";   // e.g. https://dbf...supabase.co
+String SUPABASE_HOST = "";  // parsed from SUPABASE_URL
+String SUPABASE_ANON = "";
+String DEVICE_UID = "esp32-UNSET";
+String DEVICE_NAME = "";
+
+bool deviceProvisioned = false;
+bool wifiConnected = false;
+
+Tank tanks[20];
+int  tankCount = 0;
+int  selectedTank = 0;
+
+// ----------- Prototypes -----------
+void  setupButtons();
+void  drawSplash();
+void  drawWifiStatus(const char* line1, const char* line2, int spinner = -1);
+void  drawWifiStatus(const char* line1, const String& line2, int spinner = -1);
+void  drawTanksMenu();
+void  drawMeasuring(const char* tankName, int dots);
+void  drawMeasureResult(const Reading& r);
+void  drawUploadBadge(bool ok);
+
+bool  connectWifi();
+bool  fetchTanks();
+bool  insertReading(const String& tankId, const Reading& r);
+bool  httpBegin(HTTPClient& http, WiFiClientSecure& client, const String& url);
+
+Reading takeReading();
+float   measureTemp();
+float   measurePH();
+int     measureTDS(float TEMP);
+
+template<typename T>
+T medianOf(T* arr, int n){
+  for(int i=1;i<n;i++){ T key=arr[i]; int j=i-1; while(j>=0 && arr[j]>key){arr[j+1]=arr[j]; j--;} arr[j+1]=key; }
+  if(n%2) return arr[n/2];
+  return (arr[n/2 - 1] + arr[n/2]) / 2.0;
+}
+
+// ======== Helpers ========
+String parseHostFromUrl(const String& url){
+  // expect https://<host>[/...]
+  String s = url;
+  if (s.startsWith("https://")) s.remove(0, 8);
+  int slash = s.indexOf('/');
+  if (slash >= 0) s = s.substring(0, slash);
+  s.trim();
+  return s;
+}
+
+static void notifyBytes(const uint8_t* data, size_t len){
+  if (!deviceConnected || !pTxChar) return;
+  pTxChar->setValue((uint8_t*)data, len);
+  pTxChar->notify();
+}
+static void notifyLine(const String& line){
+  notifyBytes((const uint8_t*)line.c_str(), line.length());
+}
+
+// ================= SENSOR MEASUREMENT (CALIBRATED) =================
+// pH calibration: -0.0053 * ADC + 15.7453
+float measurePH() {
+  int sensorValue = analogRead(PH_PIN);          // 0..4095
+  float phValue = -0.0053f * sensorValue + 15.7453f;
+  return phValue;
+}
+
+// TDS: temp compensation + cubic + ×0.544 factor
+int measureTDS(float TEMP) {
+  int sensorValue = analogRead(TDS_PIN);         // 0..4095
+  float voltage = sensorValue * (3.3f / 4095.0f);
+  float compensationCoefficient = 1.0f + 0.02f * (TEMP - 25.0f);
+  float compensatedVoltage = voltage / compensationCoefficient;
+  float tdsValue = (133.42f * pow(compensatedVoltage, 3)
+                 - 255.86f * pow(compensatedVoltage, 2)
+                 + 857.39f * compensatedVoltage) * 0.5f;
+  tdsValue = tdsValue * 0.544f;
+  return (int)tdsValue;
+}
+
+// DS18B20 temperature (Celsius), guarded
+float measureTemp() {
+  sensors.requestTemperatures();
+  float t = sensors.getTempCByIndex(0);
+  if (t < -100.0f || t > 85.0f) t = 25.0f; // fallback
+  return t;
+}
+
+// Take samples (temp first), then pH + TDS, return medians
+Reading takeReading(){
+  const int NUM_SAMPLES = 10;
+  float phSamples[NUM_SAMPLES];
+  int   tdsSamples[NUM_SAMPLES];
+  float tempSamples[NUM_SAMPLES];
+  const unsigned long interval = 1000 / NUM_SAMPLES; // ~100ms
+
+  // Temperature first
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    tempSamples[i] = measureTemp();
+    drawMeasuring(tankCount ? tanks[selectedTank].name.c_str() : "Tank", i % 4);
+    if (i < NUM_SAMPLES - 1) delay(interval);
+  }
+  float tempC_med = medianOf(tempSamples, NUM_SAMPLES);
+
+  // pH + TDS
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    phSamples[i]  = measurePH();
+    tdsSamples[i] = measureTDS(tempC_med);
+    drawMeasuring(tankCount ? tanks[selectedTank].name.c_str() : "Tank", i % 4);
+    if (i < NUM_SAMPLES - 1) delay(interval);
+  }
+
+  Reading r;
+  r.tempC = tempC_med;
+  r.tempF = r.tempC * 9.0f/5.0f + 32.0f;
+  r.ph    = medianOf(phSamples, NUM_SAMPLES);
+  r.tds   = medianOf(tdsSamples, NUM_SAMPLES);
+  return r;
+}
+
+// ================= Wi-Fi =================
+bool connectWifi() {
+  if (WIFI_SSID.isEmpty()) {
+    Serial.println("No Wi-Fi creds saved; waiting for BLE provisioning…");
+    drawWifiStatus("Waiting for", "Bluetooth setup", -1);
+    return false;
+  }
+
+  Serial.printf("Connecting to Wi-Fi [%s]\n", WIFI_SSID.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+
+  uint32_t start = millis();
+  int spin = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+    drawWifiStatus("Connecting Wi-Fi", WIFI_SSID, spin++ % 4);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.printf("Wi-Fi OK  IP: %s  RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    drawWifiStatus("Wi-Fi Connected", WiFi.localIP().toString(), -1);
+    return true;
+  } else {
+    wifiConnected = false;
+    Serial.printf("Wi-Fi FAILED (status=%d)\n", WiFi.status());
+    drawWifiStatus("Wi-Fi FAILED", "Check SSID/2.4GHz", -1);
+    return false;
+  }
+}
+
+// ================= HTTPS helpers =================
+bool httpBegin(HTTPClient& http, WiFiClientSecure& client, const String& url){
+  client.setInsecure(); // demo; pin a CA for prod
+  client.setHandshakeTimeout(TLS_TIMEOUT_MS);
+  client.setTimeout(TLS_TIMEOUT_MS);
+  if (!http.begin(client, url)) return false;
+  http.setConnectTimeout(TLS_TIMEOUT_MS);
+  http.setTimeout(TLS_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_ANON);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON);
+  return true;
+}
+
+// ================= Fetch tanks =================
+bool fetchTanks(){
+  if (!wifiConnected || SUPABASE_HOST.isEmpty()) return false;
+
+  tankCount = 0;
+  drawWifiStatus("Fetching tanks...", "", -1);
+
+  IPAddress ip;
+  if (!WiFi.hostByName(SUPABASE_HOST.c_str(), ip)) {
+    Serial.println("DNS FAILED");
+    drawWifiStatus("DNS FAILED", "", -1);
+    return false;
+  }
+
+  String url = "https://" + SUPABASE_HOST + "/rest/v1/tanks?select=id,name&order=name.asc";
+  WiFiClientSecure client;
+  HTTPClient http;
+  if(!httpBegin(http, client, url)){ Serial.println("http.begin failed"); drawWifiStatus("HTTP begin failed", "", -1); return false; }
+
+  int code = http.GET();
+  String body = http.getString();
+  http.end();
+  Serial.printf("GET /tanks -> %d\n", code);
+
+  if (code != HTTP_CODE_OK) {
+    Serial.println(body);
+    drawWifiStatus("Fetch tanks failed", String("HTTP ") + code, -1);
+    return false;
+  }
+
+  // Parse: [{"id":"...","name":"..."},...]
+  int pos = 0;
+  while (tankCount < 20) {
+    int idK = body.indexOf("\"id\":\"", pos);    if (idK < 0) break;
+    int idQ = body.indexOf("\"", idK + 6);       if (idQ < 0) break;
+    int nmK = body.indexOf("\"name\":\"", idQ);  if (nmK < 0) break;
+    int nmQ = body.indexOf("\"", nmK + 8);       if (nmQ < 0) break;
+    tanks[tankCount].id   = body.substring(idK + 6, idQ);
+    tanks[tankCount].name = body.substring(nmK + 8, nmQ);
+    tankCount++;
+    pos = nmQ + 1;
+  }
+
+  Serial.printf("Fetched %d tank(s):\n", tankCount);
+  for (int i=0;i<tankCount;i++){
+    Serial.printf("  [%d] %s  (id=%s)\n", i, tanks[i].name.c_str(), tanks[i].id.c_str());
+  }
+  if (tankCount == 0) drawWifiStatus("No tanks found", "", -1);
+  if (selectedTank >= tankCount) selectedTank = 0;
+
+  drawTanksMenu();
+  return tankCount > 0;
+}
+
+// ================= Insert reading =================
+bool insertReading(const String& tankId, const Reading& r){
+  if (!wifiConnected || SUPABASE_HOST.isEmpty()) return false;
+
+  String url = "https://" + SUPABASE_HOST + "/rest/v1/sensor_readings";
+  WiFiClientSecure client; HTTPClient http;
+  if(!httpBegin(http, client, url)){ Serial.println("http.begin failed"); return false; }
+
+  String json = String("{")
+    + "\"tank_id\":\"" + tankId + "\","
+    + "\"device_uid\":\"" + DEVICE_UID + "\","
+    + "\"temperature\":" + String(r.tempF,1) + ","
+    + "\"ph\":" + String(r.ph,2) + ","
+    + "\"tds\":" + String(r.tds)
+    + "}";
+
+  http.addHeader("Prefer", "return=representation");
+  int code = http.POST(json);
+  String body = http.getString();
+  http.end();
+
+  Serial.printf("POST /sensor_readings -> %d\n", code);
+  if (body.length()) Serial.println(body);
+  return code >= 200 && code < 300;
+}
+
+// ================= OLED drawing =================
+void drawSplash(){
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(8, 8);  display.print("AquaSpec");
+  display.setTextSize(1);
+  display.setCursor(8, 36); display.print("BLE Provisioning");
+  display.display();
+}
+
+void drawWifiStatus(const char* line1, const char* line2, int spinner){
+  static const char* sp[4] = {"-", "\\", "|", "/"};
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 10);  display.print(line1);
+  display.setCursor(2, 24);  display.print(line2);
+  if (spinner >= 0) {
+    display.setCursor(112, 10); display.print(sp[spinner%4]);
+  }
+  display.display();
+}
+void drawWifiStatus(const char* line1, const String& line2, int spinner){
+  drawWifiStatus(line1, line2.c_str(), spinner);
+}
+
+void drawTanksMenu(){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (tankCount == 0) {
+    display.setCursor(2, 10); display.print("No tanks found");
+    display.setCursor(2, 24); display.print("Open app to sync list");
+    display.display();
+    return;
+  }
+
+  // Header
+  display.setCursor(2, 0);
+  display.print("Select Tank ");
+  display.print(selectedTank+1); display.print("/"); display.print(tankCount);
+
+  // Show up to 4 entries around selection
+  int start = selectedTank - 1;
+  if (start < 0) start = 0;
+  if (start > max(0, tankCount-4)) start = max(0, tankCount-4);
+
+  for (int i=0; i<4 && (start+i) < tankCount; i++){
+    int idx = start + i;
+    int y = 14 + i*13;
+    if (idx == selectedTank) {
+      display.setCursor(0, y); display.print(">");
+      display.fillRect(8, y-1, 120, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(10, y); display.print(tanks[idx].name);
+      display.setTextColor(SSD1306_WHITE);
+    } else {
+      display.setCursor(10, y); display.print(tanks[idx].name);
+    }
+  }
+
+  display.setCursor(2, 58);
+  display.print("UP/DOWN  SELECT=Measure");
+  display.display();
+}
+
+void drawMeasuring(const char* tankName, int dots){
+  static const char* spin[4] = {"-", "\\", "|", "/"};
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0);  display.print("Measuring ");
+  display.print(spin[dots%4]);
+  display.setCursor(2, 12); display.print(tankName);
+  display.setCursor(2, 32); display.print("Please wait...");
+  display.display();
+}
+
+void drawMeasureResult(const Reading& r){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0);  display.print("Result");
+  display.setCursor(2, 16); display.print("pH: ");   display.print(r.ph, 2);
+  display.setCursor(2, 28); display.print("TDS: ");  display.print(r.tds); display.print(" ppm");
+  display.setCursor(2, 40); display.print("Temp: "); display.print(r.tempC,1); display.print((char)247); display.print("C");
+  display.setCursor(2, 52); display.print("("); display.print(r.tempF,1); display.print((char)247); display.print("F)");
+  display.display();
+}
+
+void drawUploadBadge(bool ok){
+  display.fillRect(88, 0, 40, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(92, 2); display.print(ok ? "Sent" : "Fail");
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+}
+
+// ================= BLE =================
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override {
+    deviceConnected = true;
+    notifyLine("BLE connected\n");
+  }
+  void onDisconnect(BLEServer* s) override {
+    deviceConnected = false;
+    BLEDevice::startAdvertising();
+  }
+};
+
+void handleCommandLine(const std::string& cmd){
+  // Examples:
+  // PROVISION:SSID|PASS|DEVICE_UID|SUPABASE_URL|SUPABASE_KEY
+  // SET_TANKS:name1|name2|...
+  // SET_TANK_IDS:id1|id2|...
+  // SET_NAME:Nice Device
+  // SELECT_TANK:2
+  // NEXT_TANK / PREV_TANK / MEASURE
+
+  if (cmd == "PING") { notifyLine("PONG\n"); return; }
+  if (cmd == "NEXT_TANK") {
+    if (tankCount > 0) { selectedTank = (selectedTank + 1) % tankCount; drawTanksMenu(); }
+    return;
+  }
+  if (cmd == "PREV_TANK") {
+    if (tankCount > 0) { selectedTank = (selectedTank - 1 + tankCount) % tankCount; drawTanksMenu(); }
+    return;
+  }
+  if (cmd == "MEASURE") {
+    if (tankCount == 0) { notifyLine("ERR: No tanks\n"); return; }
+    Reading r = takeReading();
+    drawMeasureResult(r);
+    bool ok = insertReading(tanks[selectedTank].id, r);
+    drawUploadBadge(ok);
+    notifyLine(ok ? "OK\n" : "FAIL\n");
+    delay(1200);
+    drawTanksMenu();
+    return;
+  }
+
+  // PROVISION
+  if (cmd.rfind("PROVISION:", 0) == 0) {
+    String payload = String(cmd.c_str() + 10);
+    String parts[5]; int pi = 0, start = 0;
+    while (pi < 5) {
+      int bar = payload.indexOf('|', start);
+      if (bar < 0) { parts[pi++] = payload.substring(start); break; }
+      parts[pi++] = payload.substring(start, bar);
+      start = bar + 1;
+    }
+    WIFI_SSID = parts[0]; WIFI_SSID.trim();
+    WIFI_PASS = parts[1]; WIFI_PASS.trim();
+    DEVICE_UID = parts[2]; DEVICE_UID.trim();
+    SUPABASE_URL = parts[3]; SUPABASE_URL.trim();
+    SUPABASE_ANON = parts[4]; SUPABASE_ANON.trim();
+    SUPABASE_HOST = parseHostFromUrl(SUPABASE_URL);
+
+    prefs.begin("aquaspec", false);
+    prefs.putString("ssid", WIFI_SSID);
+    prefs.putString("pass", WIFI_PASS);
+    prefs.putString("duid", DEVICE_UID);
+    prefs.putString("url",  SUPABASE_URL);
+    prefs.putString("host", SUPABASE_HOST);
+    prefs.putString("anon", SUPABASE_ANON);
+    prefs.putBool("provisioned", true);
+    prefs.end();
+
+    notifyLine("Provision OK, rebooting\n");
+    delay(250);
+    ESP.restart();
+    return;
+  }
+
+  // SET_TANKS
+  if (cmd.rfind("SET_TANKS:", 0) == 0) {
+    String p = String(cmd.c_str() + 10);
+    tankCount = 0; int startIdx = 0;
+    while (tankCount < 20) {
+      int bar = p.indexOf('|', startIdx);
+      String name = (bar < 0) ? p.substring(startIdx) : p.substring(startIdx, bar);
+      name.trim();
+      if (name.length() == 0) break;
+      tanks[tankCount].name = name;
+      // keep existing ids aligned if already set
+      tankCount++;
+      if (bar < 0) break;
+      startIdx = bar + 1;
+    }
+    if (selectedTank >= tankCount) selectedTank = 0;
+    notifyLine(String("Tanks: ") + tankCount + "\n");
+    drawTanksMenu();
+    return;
+  }
+
+  // SET_TANK_IDS
+  if (cmd.rfind("SET_TANK_IDS:", 0) == 0) {
+    String p = String(cmd.c_str() + 13);
+    int idx = 0; int startIdx = 0;
+    while (idx < 20) {
+      int bar = p.indexOf('|', startIdx);
+      String id = (bar < 0) ? p.substring(startIdx) : p.substring(startIdx, bar);
+      id.trim();
+      if (id.length() == 0) break;
+      tanks[idx].id = id;
+      idx++;
+      if (bar < 0) break;
+      startIdx = bar + 1;
+    }
+    notifyLine(String("Tank IDs: ") + idx + "\n");
+    return;
+  }
+
+  // SET_NAME
+  if (cmd.rfind("SET_NAME:", 0) == 0) {
+    DEVICE_NAME = String(cmd.c_str() + 9);
+    DEVICE_NAME.trim();
+    prefs.begin("aquaspec", false);
+    prefs.putString("device_name", DEVICE_NAME);
+    prefs.end();
+    notifyLine("Name set\n");
+    return;
+  }
+
+  // SELECT_TANK
+  if (cmd.rfind("SELECT_TANK:", 0) == 0) {
+    int idx = atoi(cmd.c_str() + 12);
+    if (idx >= 0 && idx < tankCount) {
+      selectedTank = idx;
+      drawTanksMenu();
+      notifyLine("Selected\n");
+    } else {
+      notifyLine("ERR: bad index\n");
+    }
+    return;
+  }
+
+  // echo
+  notifyLine(String("ECHO:") + cmd.c_str() + "\n");
+}
+
+class RxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    std::string part = std::string((const char*)ch->getValue().data(), ch->getValue().length());
+    if (part.empty()) return;
+    g_rxBuf += part;
+
+    for(;;){
+      size_t nl = g_rxBuf.find('\n');
+      if (nl == std::string::npos) break;
+      std::string line = g_rxBuf.substr(0, nl);
+      g_rxBuf.erase(0, nl + 1);
+      while (!line.empty() && (line.back()=='\r' || line.back()=='\n')) line.pop_back();
+      if (line.empty()) continue;
+      Serial.printf("BLE RX: %s\n", line.c_str());
+      handleCommandLine(line);
+    }
+  }
+};
+
+// ================= Buttons / Setup / Loop =================
+void setupButtons(){
+  pinMode(UP_BUTTON,     INPUT_PULLUP);
+  pinMode(DOWN_BUTTON,   INPUT_PULLUP);
+  pinMode(SELECT_BUTTON, INPUT_PULLUP);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println("=== AquaSpec (BLE Provisioning + OLED + Supabase) ===");
+
+  // OLED
+  SPI.begin(OLED_CLK, -1, OLED_MOSI, OLED_CS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  } else {
+    display.setRotation(3);
+    drawSplash();
+  }
+
+  sensors.begin();
+  setupButtons();
+
+  // Load saved settings
+  prefs.begin("aquaspec", true);
+  WIFI_SSID      = prefs.getString("ssid", WIFI_SSID);
+  WIFI_PASS      = prefs.getString("pass", WIFI_PASS);
+  DEVICE_UID     = prefs.getString("duid", DEVICE_UID);
+  SUPABASE_URL   = prefs.getString("url",  SUPABASE_URL);
+  SUPABASE_HOST  = prefs.getString("host", SUPABASE_HOST);
+  SUPABASE_ANON  = prefs.getString("anon", SUPABASE_ANON);
+  DEVICE_NAME    = prefs.getString("device_name", DEVICE_NAME);
+  deviceProvisioned = prefs.getBool("provisioned", false);
+  prefs.end();
+
+  // BLE
+  BLEDevice::init(DEV_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+  BLEService* svc = pServer->createService(SERVICE_UUID);
+
+  pTxChar = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxChar->addDescriptor(new BLE2902());
+
+  BLECharacteristic* pRx = svc->createCharacteristic(
+    RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new RxCallbacks());
+
+  svc->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising…");
+
+  if (deviceProvisioned) {
+    connectWifi();
+    if (wifiConnected) fetchTanks();
+  } else {
+    drawWifiStatus("Open app to", "provision WiFi", -1);
+  }
+}
+
+void loop() {
+  static uint32_t lastFetch = 0;
+  static uint32_t lastDebounce = 0;
+  const uint32_t debounceMs = 180;
+
+  // periodic refresh of tank list (only if provisioned and WiFi up)
+  if (deviceProvisioned && wifiConnected && (millis() - lastFetch > LIST_REFRESH_MS)) {
+    lastFetch = millis();
+    fetchTanks();
+  }
+
+  if (millis() - lastDebounce > debounceMs) {
+    if (digitalRead(UP_BUTTON) == LOW && tankCount > 0) {
+      selectedTank = (selectedTank - 1 + tankCount) % tankCount;
+      drawTanksMenu();
+      lastDebounce = millis();
+    } else if (digitalRead(DOWN_BUTTON) == LOW && tankCount > 0) {
+      selectedTank = (selectedTank + 1) % tankCount;
+      drawTanksMenu();
+      lastDebounce = millis();
+    } else if (digitalRead(SELECT_BUTTON) == LOW && tankCount > 0) {
+      lastDebounce = millis();
+
+      Reading r = takeReading();
+      Serial.printf("Measured %s: pH=%.2f TDS=%d Temp=%.1fC(%.1fF)\n",
+        tanks[selectedTank].name.c_str(), r.ph, r.tds, r.tempC, r.tempF);
+
+      drawMeasureResult(r);
+      bool ok = wifiConnected ? insertReading(tanks[selectedTank].id, r) : false;
+      Serial.println(ok ? "Upload OK" : "Upload FAILED");
+      drawUploadBadge(ok);
+
+      delay(1200);
+      drawTanksMenu();
+    }
+  }
+}
