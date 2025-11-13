@@ -1,0 +1,199 @@
+/*
+  Simple ESP32 Supabase Test (Beta Tester Launch)
+  - Connects to WiFi (hardcoded)
+  - Shows default values on OLED
+  - On button press, POSTs default values to Supabase sensor_readings
+
+  Hardware assumptions (AquaSpec):
+  - SPI OLED SSD1306 128x64:
+      MOSI = 23, SCLK = 18, DC = 21, CS = 19, RESET = 22
+  - Button (SEND): GPIO 27, wired to GND (uses INPUT_PULLUP)
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ====== WiFi config ======
+const char* WIFI_SSID     = "iPhone";
+const char* WIFI_PASSWORD = "Banana16";
+
+// ====== Supabase config ======
+const char* SUPABASE_URL  = "https://dbfglovgjuzqiejekflg.supabase.co";
+const char* SUPABASE_TABLE = "/rest/v1/sensor_readings";
+
+// ⚠ WARNING: Service role key is highly sensitive. This is OK for
+// short-term prototyping, but DO NOT ship this in production firmware.
+const char* SUPABASE_SERVICE_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRiZmdsb3ZnanV6cWllamVrZmxnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0Mzg4MjY3NCwiZXhwIjoyMDU5NDU4Njc0fQ.y-0vKthVyX1K2nR1HwdmiysjuWhTkHVuSTlBOnI-fjI";
+
+// We won't actually use the anon key here, but kept for reference
+const char* SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRiZmdsb3ZnanV6cWllamVrZmxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM4ODI2NzQsImV4cCI6MjA1OTQ1ODY3NH0.mzRht4dDiCC9GQlX_5c1K_UJKWXvKeAHPBHqBVNsHvU";
+
+// Fixed tank_id you gave
+const char* TANK_ID = "caf886ff-b29f-493b-a133-56cf8c6ecebc";
+
+// ====== Default readings ======
+const float DEFAULT_PH  = 8.0;
+const float DEFAULT_TDS = 8.0;
+const float DEFAULT_TEMP = 8.0;
+
+// ====== OLED setup (SPI SSD1306 128x64) ======
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// SPI pins (ESP32 HW SPI: MOSI=23, CLK=18 by default)
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_DC     21
+#define OLED_CS     19
+#define OLED_RESET  22
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+
+// ====== Button pin ======
+const int BUTTON_PIN = 27;  // SELECT button
+bool lastButtonState = HIGH;
+
+// Forward decl
+void drawScreen(const char* statusLine);
+bool sendToSupabase();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println("SSD1306 allocation failed");
+    // Don't return; just run headless if needed
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("AquaSpec Test");
+    display.println("Connecting WiFi...");
+    display.display();
+  }
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  drawScreen("Ready: press SEND");
+}
+
+void loop() {
+  bool buttonState = digitalRead(BUTTON_PIN);
+
+  // Detect falling edge (HIGH -> LOW)
+  if (lastButtonState == HIGH && buttonState == LOW) {
+    // Debounce delay
+    delay(50);
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      Serial.println("Button pressed, sending to Supabase...");
+      drawScreen("Sending...");
+      bool ok = sendToSupabase();
+      if (ok) {
+        drawScreen("Upload OK");
+      } else {
+        drawScreen("Upload FAILED");
+      }
+    }
+  }
+
+  lastButtonState = buttonState;
+}
+
+// Draw the main screen with default values and a status line
+void drawScreen(const char* statusLine) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Default values
+  display.setCursor(0, 0);
+  display.print("pH: ");
+  display.println(DEFAULT_PH, 1);
+
+  display.setCursor(0, 20);
+  display.print("TDS: ");
+  display.println(DEFAULT_TDS, 0);
+
+  display.setCursor(0, 40);
+  display.print("Temp: ");
+  display.println(DEFAULT_TEMP, 0);
+
+  // Status line (bottom, small text)
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  display.print(statusLine);
+
+  display.display();
+}
+
+// POST to Supabase
+bool sendToSupabase() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();  // dev only; skips TLS cert validation
+
+  HTTPClient https;
+  String url = String(SUPABASE_URL) + SUPABASE_TABLE;
+
+  // Build JSON body
+  // TODO: If your column names differ, change "tank_id", "ph", "tds", "temperature"
+  String body = "{";
+  body += "\"tank_id\":\"" + String(TANK_ID) + "\",";
+  body += "\"ph\":" + String(DEFAULT_PH, 2) + ",";
+  body += "\"tds\":" + String(DEFAULT_TDS, 2) + ",";
+  body += "\"temperature\":" + String(DEFAULT_TEMP, 2);
+  body += "}";
+
+  Serial.println("POST " + url);
+  Serial.println("Body: " + body);
+
+  if (!https.begin(client, url)) {
+    Serial.println("HTTPS begin failed");
+    return false;
+  }
+
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader("apikey", SUPABASE_SERVICE_KEY);
+  https.addHeader("Authorization", String("Bearer ") + SUPABASE_SERVICE_KEY);
+  https.addHeader("Prefer", "return=minimal");
+
+  int httpCode = https.POST(body);
+  Serial.print("HTTP status: ");
+  Serial.println(httpCode);
+
+  // For debug, you can uncomment:
+  // String payload = https.getString();
+  // Serial.println("Response: " + payload);
+
+  https.end();
+
+  // Supabase returns 201 Created on successful insert
+  return (httpCode == 201 || httpCode == 200);
+}
