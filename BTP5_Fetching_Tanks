@@ -1,0 +1,71 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_RESET  22
+#define OLED_DC     21
+#define OLED_CS     19
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI,
+                         OLED_DC, OLED_RESET, OLED_CS);
+
+// Animation timing
+unsigned long lastUpdate = 0;
+const unsigned long frameInterval = 300; // ms between frames
+int frame = 0; // 0,1,2,3 -> number of dots
+
+void drawScreen(int frame) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ===== Big title, exactly like your previous screen =====
+  display.setTextSize(2);
+  display.setCursor(10, 0);  // same padding
+  display.println("");
+  display.println("Aqua");
+  display.println(" Spec");
+
+  // ===== 5 literal blank lines =====
+  display.setTextSize(1);
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+
+  // ===== "Waiting for bluetooth" with animated dots =====
+  display.println("  Loading ");
+  display.println("   tanks ");
+  for (int i = 0; i < frame; i++) {
+    display.print(". ");
+  }
+
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  SPI.begin(OLED_CLK, -1, OLED_MOSI, OLED_CS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;) {}
+  }
+
+  display.setRotation(3);
+
+  drawScreen(frame);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastUpdate >= frameInterval) {
+    lastUpdate = now;
+    frame = (frame + 1) % 6;  // 0,1,2,3 dots
+    drawScreen(frame);
+  }
+}
