@@ -1,0 +1,53 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_RESET  22
+#define OLED_DC     21
+#define OLED_CS     19
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI,
+                         OLED_DC, OLED_RESET, OLED_CS);
+
+void setup() {
+  Serial.begin(115200);
+
+  SPI.begin(OLED_CLK, -1, OLED_MOSI, OLED_CS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;) {}
+  }
+
+  display.setRotation(3); 
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ===== Big "Aquaspec" =====
+  display.setTextSize(2);
+  display.setCursor(10, 0);  // a little left padding
+  display.println("");
+  display.println("Aqua");
+  display.println(" Spec");
+
+  // Switch to small text for blank lines
+  display.setTextSize(1);
+
+  // ===== Three literal blank lines =====
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+
+  // ===== Small "by Rotala" =====
+  display.println(" Bluetooth");
+  display.println(" Connected");
+
+  display.display();
+}
+
+void loop() {}
