@@ -1,0 +1,495 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- Buttons ----------
+#define UP_BUTTON     25
+#define DOWN_BUTTON   26
+#define SELECT_BUTTON 27
+#define BACK_BUTTON   14
+
+// ===== OLED DEFINES =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_RESET  22
+#define OLED_DC     21
+#define OLED_CS     19
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI,
+                         OLED_DC, OLED_RESET, OLED_CS);
+
+// ---------- WiFi ----------
+const char* WIFI_SSID     = "iPhone";
+const char* WIFI_PASSWORD = "yeet1234";
+
+// ---------- Supabase ----------
+const char* SUPABASE_URL   = "https://dbfglovgjuzqiejekflg.supabase.co";
+const char* SUPABASE_TABLE = "/rest/v1/tanks";
+
+// ⚠ service role key (dev only, do NOT ship this)
+const char* SUPABASE_SERVICE_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRiZmdsb3ZnanV6cWllamVrZmxnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0Mzg4MjY3NCwiZXhwIjoyMDU5NDU4Njc0fQ.y-0vKthVyX1K2nR1HwdmiysjuWhTkHVuSTlBOnI-fjI";
+
+// ---------- User ----------
+const char* USER_ID = "255d3f82-115d-4918-b670-df4128af461e";
+
+// ---------- Tank storage ----------
+const int MAX_TANKS = 20;
+String tankNames[MAX_TANKS];
+int tankCount = 0;
+
+// ---------- Layout ----------
+const int HEADER_HEIGHT = 12;
+
+// We’ll show up to 5 rows.
+// Screen height 64 - header 12 = 52 px.
+// 5 rows → ~10 px per row (8px text + a bit of gap).
+const int VISIBLE_ROWS = 5;
+const int ROW_HEIGHT   = 10;  // line + tiny gap
+
+int scrollOffset  = 0;  // first tank index currently visible
+int selectedIndex = 0;  // which tank the ">" is on
+
+// ---------- Debounce ----------
+uint32_t lastDebounce = 0;
+const uint32_t DEBOUNCE_MS = 200;
+
+// ---------- Forward declarations ----------
+bool fetchTanks();
+void parseTankNames(const String& payload);
+void renderTankList();
+void drawHeader();
+void drawScrollbar();
+void drawTankRow(int index, int y, bool selected);
+
+
+// ===== BLE (ESP32) =====
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// Nordic UART-style UUIDs (you can change these to match your app)
+static BLEUUID SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID CHARACTERISTIC_UUID_RX("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID CHARACTERISTIC_UUID_TX("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pTxCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    deviceConnected = true;
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    deviceConnected = false;
+    // Restart advertising so the app can reconnect if needed
+    pServer->getAdvertising()->start();
+  }
+};
+
+
+
+// ===== INTRO STATE MACHINE =====
+enum IntroState {
+  INTRO_LOGO,
+  INTRO_BLE_WAIT,
+  INTRO_BLE_SUCCESS,
+  INTRO_DONE,
+  WIFI_WAIT,
+  WIFI_SUCCESS,
+  FETCH_TANK
+};
+
+IntroState introState = INTRO_LOGO;
+
+// Timers
+unsigned long stateStartMillis = 0;
+
+// Animation timing for "Waiting for bluetooth"
+unsigned long lastUpdate = 0;
+const unsigned long frameInterval = 300; // ms between frames
+int frame = 0; // 0..5 number of dots
+
+// ====== DRAW HELPERS ======
+
+void drawIntroLogo() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Big "Aqua / Spec"
+  display.setTextSize(2);
+  display.setCursor(10, 0);  // a little left padding
+  display.println("");
+  display.println("Aqua");
+  display.println(" Spec");
+
+  // Small "by Rotala" with blank lines
+  display.setTextSize(1);
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println(" by Rotala");
+
+  display.display();
+}
+
+void drawBleWaiting(int frameDots) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Big title, same style
+  display.setTextSize(2);
+  display.setCursor(10, 0);
+  display.println("");
+  display.println("Aqua");
+  display.println(" Spec");
+
+  // Small text
+  display.setTextSize(1);
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+
+  display.println("  Waiting ");
+  display.println("    for ");
+  display.print(" bluetooth");
+
+  // animated dots on same line
+  for (int i = 0; i < frameDots; i++) {
+    display.print(". ");
+  }
+
+  display.display();
+}
+
+void drawBleSuccess() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Big "Aqua / Spec"
+  display.setTextSize(2);
+  display.setCursor(10, 0);  // a little left padding
+  display.println("");
+  display.println("Aqua");
+  display.println(" Spec");
+
+  // Small success text
+  display.setTextSize(1);
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println("");
+  display.println(" Bluetooth");
+  display.println(" Connected");
+
+  display.display();
+}
+
+// ===== BLE INIT =====
+void initBLE() {
+  BLEDevice::init("AquaSpec");  // device name that shows in scans
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  // TX (notify to app)
+  pTxCharacteristic = pService->createCharacteristic(
+                         CHARACTERISTIC_UUID_TX,
+                         BLECharacteristic::PROPERTY_NOTIFY
+                       );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // RX (write from app)
+  BLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+                                           CHARACTERISTIC_UUID_RX,
+                                           BLECharacteristic::PROPERTY_WRITE
+                                         );
+
+  pService->start();
+
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // some recommended defaults
+  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->start();
+
+  Serial.println("BLE advertising as AquaSpec...");
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+
+  // Button setup
+  pinMode(UP_BUTTON, INPUT_PULLUP);
+  pinMode(DOWN_BUTTON, INPUT_PULLUP);
+  pinMode(SELECT_BUTTON, INPUT_PULLUP);
+  pinMode(BACK_BUTTON, INPUT_PULLUP);
+
+  // OLED init
+  SPI.begin(OLED_CLK, -1, OLED_MOSI, OLED_CS);
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;) {}
+  }
+  display.setRotation(3);
+
+  // Show Screen 1 immediately
+  drawIntroLogo();
+  introState = INTRO_LOGO;
+  stateStartMillis = millis();
+
+  // Start BLE so it's ready when we hit screen 2
+  initBLE();
+}
+
+// ===== LOOP =====
+void loop() {
+  unsigned long now = millis();
+
+  switch (introState) {
+    case INTRO_LOGO:
+      // Stay on "Aquaspec by Rotala" for 2 seconds
+      if (now - stateStartMillis >= 2000) {
+        introState = INTRO_BLE_WAIT;
+        stateStartMillis = now;
+        frame = 0;
+        lastUpdate = now;
+        drawBleWaiting(frame);
+      }
+      break;
+
+    case INTRO_BLE_WAIT:
+      // Animate "Waiting for bluetooth" while advertising BLE
+      if (now - lastUpdate >= frameInterval) {
+        lastUpdate = now;
+        frame = (frame + 1) % 6;  // 0..5
+        drawBleWaiting(frame);
+      }
+
+      // If BLE connects, go to success screen
+      if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+        introState = INTRO_BLE_SUCCESS;
+        stateStartMillis = now;
+        drawBleSuccess();
+      }
+      break;
+
+    case INTRO_BLE_SUCCESS:
+      // Show success screen for 3 seconds
+      if (now - stateStartMillis >= 5000) {
+        introState = WIFI_WAIT;
+        // For now, just leave the success screen up.
+        // Later we can transition into the tank list or main UI here.
+      }
+      break;
+
+    // REPLACED WITH WIFI_WAIT
+    // case INTRO_DONE:
+    //   // Do nothing for now – stays on Bluetooth Connected screen
+    //   break;
+
+      case WIFI_WAIT:
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        Serial.print("Connecting to WiFi");
+        while (WiFi.status() != WL_CONNECTED) {
+          delay(500);
+          Serial.print(".");
+        }
+        introState = WIFI_SUCCESS;
+        break;
+
+      case WIFI_SUCCESS:
+        Serial.println("\nWiFi connected");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi connected");
+        display.display();
+        introState = FETCH_TANK;
+      break;
+
+      case FETCH_TANK:
+        display.println("Fetching tanks...");
+        display.display();
+          // Fetch tanks
+        if (fetchTanks()) {
+          scrollOffset  = 0;
+          selectedIndex = 0;
+          renderTankList();
+        } else {
+          display.clearDisplay();
+          drawHeader();
+          display.setCursor(2, HEADER_HEIGHT + 4);
+          display.println("Error fetching tanks");
+          display.display();
+        }
+      break;
+  }
+
+  // Track disconnects (in case you care later)
+  if (!deviceConnected && oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+    // Optionally: jump back to INTRO_BLE_WAIT here if you want
+    // introState = INTRO_BLE_WAIT;
+    // stateStartMillis = millis();
+  }
+}
+
+// =================== SUPABASE =====================
+bool fetchTanks() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+
+  String url = String(SUPABASE_URL) + SUPABASE_TABLE +
+               "?user_id=eq." + USER_ID +
+               "&select=name";
+
+  Serial.println("GET " + url);
+
+  if (!https.begin(client, url)) {
+    Serial.println("HTTPS begin failed");
+    return false;
+  }
+
+  https.addHeader("apikey", SUPABASE_SERVICE_KEY);
+  https.addHeader("Authorization", String("Bearer ") + SUPABASE_SERVICE_KEY);
+
+  int code = https.GET();
+  Serial.print("HTTP status: ");
+  Serial.println(code);
+  if (code != 200) {
+    https.end();
+    return false;
+  }
+
+  String payload = https.getString();
+  https.end();
+  Serial.println("Payload:");
+  Serial.println(payload);
+
+  parseTankNames(payload);
+  return tankCount > 0;
+}
+
+void parseTankNames(const String& payload) {
+  tankCount = 0;
+  int idx = 0;
+  while (tankCount < MAX_TANKS) {
+    int pos = payload.indexOf("\"name\":\"", idx);
+    if (pos == -1) break;
+    pos += 8;
+    int end = payload.indexOf("\"", pos);
+    if (end == -1) break;
+    tankNames[tankCount++] = payload.substring(pos, end);
+    idx = end + 1;
+  }
+  Serial.print("Found tanks: ");
+  Serial.println(tankCount);
+}
+
+// =================== DRAWING ======================
+
+void drawHeader() {
+  // Inverted "Tanks" title bar
+  display.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setCursor(2, 2);
+  display.print("Tanks");
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+}
+
+void drawScrollbar() {
+  if (tankCount <= VISIBLE_ROWS) return;
+
+  int trackX = SCREEN_WIDTH - 4;
+  int trackY = HEADER_HEIGHT;
+  int trackH = SCREEN_HEIGHT - HEADER_HEIGHT;
+
+  display.drawRect(trackX, trackY, 4, trackH - 1, SSD1306_WHITE);
+
+  float ratioVisible = (float)VISIBLE_ROWS / (float)tankCount;
+  int sliderH = (int)(trackH * ratioVisible);
+  if (sliderH < 4) sliderH = 4;
+
+  float ratioOffset = 0.0;
+  int maxOffset = tankCount - VISIBLE_ROWS;
+  if (maxOffset > 0) {
+    ratioOffset = (float)scrollOffset / (float)maxOffset;
+  }
+
+  int sliderY = trackY + (int)((trackH - sliderH) * ratioOffset);
+  display.fillRect(trackX + 1, sliderY, 2, sliderH, SSD1306_WHITE);
+}
+
+void drawTankRow(int index, int y, bool selected) {
+  if (index < 0 || index >= tankCount) return;
+
+  String name = tankNames[index];
+
+  // For 128px wide, text size 1 → about 21 chars fit.
+  const int MAX_CHARS = 21;
+  if (name.length() > MAX_CHARS) {
+    name = name.substring(0, MAX_CHARS - 3) + "...";
+  }
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+  // Selector arrow
+  display.setCursor(0, y);
+  display.print(selected ? ">" : " ");
+
+  // Tank name
+  display.setCursor(10, y);
+  display.print(name);
+}
+
+void renderTankList() {
+  display.clearDisplay();
+
+  drawHeader();
+
+  int startY = HEADER_HEIGHT + 2;
+
+  int rowsToShow = VISIBLE_ROWS;
+  if (tankCount - scrollOffset < VISIBLE_ROWS) {
+    rowsToShow = tankCount - scrollOffset;
+  }
+
+  for (int i = 0; i < rowsToShow; i++) {
+    int idx = scrollOffset + i;
+    int y = startY + i * ROW_HEIGHT;
+    bool isSelected = (idx == selectedIndex);
+    drawTankRow(idx, y, isSelected);
+  }
+
+  drawScrollbar();
+
+  display.display();
+
+}
